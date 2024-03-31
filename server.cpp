@@ -86,9 +86,14 @@ int main()
     std::cout << "CommandServer ready." << std::endl;
     int nextThread = 0;
     
+    //A table of bools to tell us which threads are currently in use
     bool threadIsUsed[max_thread_count];    
+
+    //Our thread data
     pthread_t clientTid[max_thread_count];
     pthread_attr_t clientAttr[max_thread_count]; 
+
+    //Loop until we want to shut down the server
     while(true)
     {
         //There's a thread available for us
@@ -101,6 +106,7 @@ int main()
                 exit(EXIT_FAILURE);
             }
 
+            //ClientData to be passed to child thread as arg
             struct ClientData client;
             client.session_id = rand();
             client.socket = new_socket;
@@ -109,7 +115,7 @@ int main()
             std::cout << "Launching a new thread with Session ID " << client.session_id << std::endl;
             //Create new thread
             pthread_attr_init(&clientAttr[nextThread]);
-            std::cout << pthread_create(&clientTid[nextThread], &clientAttr[nextThread], &ServerThread, &client) << std::endl;
+            pthread_create(&clientTid[nextThread], &clientAttr[nextThread], &ServerThread, &client);
             threadIsUsed[nextThread] = true;
 
             //Check if there's an open thread
@@ -169,12 +175,14 @@ void* ServerThread(void* client)
     bool done = false;
     while(!done)
     {
-        //1 minute timeout
-        socket_timeout.tv_sec = 60;
+        //30 sec timeout
+        socket_timeout.tv_sec = 30;
         socket_timeout.tv_usec = 0;
         FD_ZERO(&fdread);
         FD_SET(new_socket, &fdread);
         //Select returns the number of FDs on success
+        //Select is outdated and doesn't support a socket fd larger than 1024
+        //Not a huge issue for this basic application though.
         if(new_socket+1 >= FD_SETSIZE)
         {
             perror("Socket too large. Abort.");
@@ -195,11 +203,18 @@ void* ServerThread(void* client)
             done = true;
             break;
         default:
+            //Read byte data from client
             valread = read( new_socket , buffer, 1024);
             std::string client_message = buffer;
+
+            //Safe default
             std::string send_buf = "Invalid argument. Please try again.";
             int index = client_message.find_first_of(" ");
+
+            //First word is a substring of the message up through the first space character (space not included)
             std::string word = client_message.substr(0, index);
+
+            //Remove the first word and space from the entire string
             client_message = client_message.substr(index+1);
 
             //Not end of string, and the space isnt the final character in our string
@@ -207,6 +222,7 @@ void* ServerThread(void* client)
             bool commandHasArgs = index != std::string::npos && index != client_message.length() - 1;
             if(commandHasArgs)
             {
+                //Safe default
                 bool addAccess = false;
                 
                 //If we're adding access, we want to pass 'true' along in our EditAccess argument
@@ -232,11 +248,13 @@ void* ServerThread(void* client)
             
             std::cout << send_buf << std::endl;
 
+            //Send our text buffer to the client
             send(new_socket , send_buf.c_str() , send_buf.length() , 0 );
             std::cout << "Message sent to client." << std::endl;
         }
     }
 
+    //Terminate thread
     pthread_exit(0);
 }
 
