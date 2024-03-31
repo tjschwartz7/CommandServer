@@ -5,6 +5,8 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/select.h>
+#include <pthread.h>
 
 #include <chrono>
 
@@ -28,15 +30,26 @@ using all of these linux includes.
 
 std::string CheckAccess(std::string message, SecureAccess& schema);
 std::string EditAccess(std::string message, SecureAccess& schema, bool addAccess);
+void* ServerThread(void* client);
+
+struct ClientData
+{
+    int socket;
+    int session_id;
+    SecureAccess* schema;
+};
+
 
 int main() 
 {
+    std::cout << "CommandServer powering on." << std::endl;
+    srand(time(NULL));
     SecureAccess schema(10000);
-    int server_fd, new_socket, valread;
+    int server_fd, new_socket;
     struct sockaddr_in address;
     int opt = 1;
     int addrlen = sizeof(address);
-    char buffer[1024] = {0};
+    int max_thread_count = 5;
 
     // Creating socket file descriptor
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) 
@@ -69,59 +82,162 @@ int main()
         exit(EXIT_FAILURE);
     }
 
-    std::cout << "Listening for connection on port " << PORT << std::endl;
-    if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) 
+
+    std::cout << "CommandServer ready." << std::endl;
+    int nextThread = 0;
+    
+    bool threadIsUsed[max_thread_count];    
+    pthread_t clientTid[max_thread_count];
+    pthread_attr_t clientAttr[max_thread_count]; 
+    while(true)
     {
-        perror("accept");
-        exit(EXIT_FAILURE);
+        //There's a thread available for us
+        if(nextThread != -1)
+        {
+            std::cout << "Listening for connection on port " << PORT << std::endl;
+            if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) 
+            {
+                perror("accept");
+                exit(EXIT_FAILURE);
+            }
+
+            struct ClientData client;
+            client.session_id = rand();
+            client.socket = new_socket;
+            client.schema = &schema;
+
+            std::cout << "Launching a new thread with Session ID " << client.session_id << std::endl;
+            //Create new thread
+            pthread_attr_init(&clientAttr[nextThread]);
+            std::cout << pthread_create(&clientTid[nextThread], &clientAttr[nextThread], &ServerThread, &client) << std::endl;
+            threadIsUsed[nextThread] = true;
+
+            //Check if there's an open thread
+            //No thread available - default
+            nextThread = -1;
+            for(int i = 0; i < max_thread_count; i++)
+            {
+                //Thread i is not in use
+                if(!threadIsUsed[i])
+                {
+                    //We can create a thread with index i 
+                    nextThread = i;
+                    break;
+                }
+            }
+        }
+
+        //Try each thread
+        for(int i = 0; i < max_thread_count; i++)
+        {
+            if(!threadIsUsed[i]) continue;
+            //If thread is finished, reclaim it
+            int ret = pthread_tryjoin_np(clientTid[i], NULL);
+
+            //Thread is not finished
+            if(ret == EBUSY)
+                    continue;
+            else //We can use this thread again
+            {
+                std::cout << "Thread " << i << " has finished." << std::endl;
+                threadIsUsed[i] = false;
+                if(nextThread == -1) nextThread = i;
+            }
+               
+        }
     }
+    
+    
+    return 0;
+}
+
+void* ServerThread(void* client)
+{
+    char buffer[1024] = {0};
+    int valread;
+    fd_set fdread;
+    struct timeval socket_timeout;
+
+    //Initialize our client struct
+    struct ClientData* data = static_cast<ClientData*>(client);
+    int new_socket = data->socket;
+    SecureAccess* schema = data->schema;
+
+    std::cout << "New thread running: Session ID = " << data->session_id << std::endl;
 
     //We have a session
     bool done = false;
     while(!done)
     {
-        valread = read( new_socket , buffer, 1024);
-
-        std::string client_message = buffer;
-        std::string send_buf = "Invalid argument. Please try again.";
-        int index = client_message.find_first_of(" ");
-        std::string word = client_message.substr(0, index);
-        client_message = client_message.substr(index+1);
-
-        //Not end of string, and the space isnt the final character in our string
-        //All commands in this block have arguments
-        bool commandHasArgs = index != std::string::npos && index != client_message.length() - 1;
-        if(commandHasArgs)
+        //1 minute timeout
+        socket_timeout.tv_sec = 60;
+        socket_timeout.tv_usec = 0;
+        FD_ZERO(&fdread);
+        FD_SET(new_socket, &fdread);
+        //Select returns the number of FDs on success
+        if(new_socket+1 >= FD_SETSIZE)
         {
-            bool addAccess = false;
-            
-            //If we're adding access, we want to pass 'true' along in our EditAccess argument
-            if(word == "AddAccess") addAccess = true;
-            
-            //Edit Access case
-            if(word == "AddAccess" ||
-               word == "RemoveAccess")
-            {
-                send_buf = EditAccess(client_message, schema, addAccess);
-                
-            }
-            else if(word == "CheckAccess")
-            {
-                send_buf = CheckAccess(client_message, schema);
-            }
+            perror("Socket too large. Abort.");
+            exit(1);
         }
-        else if(word == "Quit")
-        {
-            send_buf = "Terminating program.\n";
-            done = true;
-        }
+        int selectStatus;
+
+        //Poll socket to see if a read is available
+        selectStatus = select(new_socket+1,&fdread, NULL, NULL, &socket_timeout);
         
-        std::cout << send_buf << std::endl;
+        switch (selectStatus)
+        {
+            //Any nonpositive integer is a failure case
+        case -1:
+        case 0:
+            //Timed out
+            std::cout << "Session ID = " << data->session_id << ". Session timed out." << std::endl;
+            done = true;
+            break;
+        default:
+            valread = read( new_socket , buffer, 1024);
+            std::string client_message = buffer;
+            std::string send_buf = "Invalid argument. Please try again.";
+            int index = client_message.find_first_of(" ");
+            std::string word = client_message.substr(0, index);
+            client_message = client_message.substr(index+1);
 
-        send(new_socket , send_buf.c_str() , send_buf.length() , 0 );
-        std::cout << "Message sent to client." << std::endl;
+            //Not end of string, and the space isnt the final character in our string
+            //All commands in this block have arguments
+            bool commandHasArgs = index != std::string::npos && index != client_message.length() - 1;
+            if(commandHasArgs)
+            {
+                bool addAccess = false;
+                
+                //If we're adding access, we want to pass 'true' along in our EditAccess argument
+                if(word == "AddAccess") addAccess = true;
+                
+                //Edit Access case
+                if(word == "AddAccess" ||
+                word == "RemoveAccess")
+                {
+                    send_buf = EditAccess(client_message, *schema, addAccess);
+                    
+                }
+                else if(word == "CheckAccess")
+                {
+                    send_buf = CheckAccess(client_message, *schema);
+                }
+            }
+            else if(word == "Quit")
+            {
+                send_buf = "Terminating connection.\n";
+                done = true;
+            }
+            
+            std::cout << send_buf << std::endl;
+
+            send(new_socket , send_buf.c_str() , send_buf.length() , 0 );
+            std::cout << "Message sent to client." << std::endl;
+        }
     }
-    return 0;
+
+    pthread_exit(0);
 }
 
 
